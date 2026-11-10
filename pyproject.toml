@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "terraform-mirror"
+version = "1.0.0"
+description = "Caching mirror for the Terraform module registry and provider network protocols (filesystem + S3)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+# Deliberately empty: the runtime uses only the standard library.
+dependencies = []
+
+[project.optional-dependencies]
+# Not needed to run the proxy: `botocore` cross-checks the hand-written SigV4 signature,
+# `cryptography` mints a throwaway certificate for the TLS health-probe tests.
+dev = ["botocore>=1.31", "cryptography>=42"]
+
+[project.scripts]
+terraform-mirror = "terraform_mirror.__main__:main"
+
+[tool.setuptools]
+packages = ["terraform_mirror", "terraform_mirror.storage"]
+
+[tool.ruff]
+line-length = 118
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+ignore = ["E501", "SIM105", "B904"]

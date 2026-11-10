@@ -1,0 +1,118 @@
+name: CI
+
+# Everything that is not a release: the suite on every supported Python, a real
+# image build and a smoke test of the built container.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: tests (python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Version
+        run: python --version
+
+      # Without these the suite silently skips two groups: the SigV4 cross-check needs
+      # botocore, the TLS health-probe tests need cryptography to mint a certificate.
+      - name: Optional test extras
+        run: python -m pip install --quiet botocore cryptography
+
+      - name: Unit tests
+        run: python -m unittest discover -s tests -t . -v
+
+  image:
+    name: docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          load: true
+          push: false
+          tags: terraform-mirror:ci
+          cache-from: type=gha,scope=runtime
+          cache-to: type=gha,mode=max,scope=runtime
+
+      - name: Run the suite inside the test image
+        run: |
+          docker build --target test -t terraform-mirror:test .
+          docker run --rm terraform-mirror:test
+
+      - name: Smoke test /healthz
+        run: |
+          docker run -d --name terraform-mirror -p 8080:8080 \
+            -e TFM_BACKENDS=fs terraform-mirror:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/healthz; then break; fi
+            sleep 1
+          done
+          echo
+          curl -fsS http://127.0.0.1:8080/.well-known/terraform.json
+          echo
+          docker logs terraform-mirror
+          # The image HEALTHCHECK itself (it runs `terraform-mirror ping`): interval 30s,
+          # start-period 10s, so give it ~60s before calling it unhealthy.
+          for i in $(seq 1 36); do
+            status=$(docker inspect --format '{{.State.Health.Status}}' terraform-mirror)
+            running=$(docker inspect --format '{{.State.Running}}' terraform-mirror)
+            if [ "$status" = healthy ] || [ "$running" = false ]; then break; fi
+            sleep 3
+          done
+          echo "health: $status (running=$running, after $i checks)"
+          docker logs terraform-mirror
+          [ "$status" = healthy ]
+          docker rm -f terraform-mirror
+
+      - name: Smoke test the HEALTHCHECK over TLS
+        run: |
+          # The regression this catches: with TFM_TLS_* the same socket comes back
+          # TLS-wrapped, so a plain http probe never goes healthy.
+          openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 1 -nodes \
+            -subj "/CN=tf.example.lan" > /dev/null 2>&1
+          # OpenSSL creates the key 0600 and the runner owns it; the image runs as an
+          # unprivileged user with another uid, and load_cert_chain dies with EACCES.
+          chmod 644 key.pem cert.pem
+          docker run -d --name terraform-mirror-tls -p 8443:8443 \
+            -e TFM_BACKENDS=fs -e TFM_PORT=8443 \
+            -e TFM_TLS_CERT=/certs/cert.pem -e TFM_TLS_KEY=/certs/key.pem \
+            -v "$PWD/cert.pem:/certs/cert.pem:ro" -v "$PWD/key.pem:/certs/key.pem:ro" \
+            terraform-mirror:ci
+          # retries=3 after a 10s start period at a 30s interval: unhealthy needs ~100s.
+          for i in $(seq 1 36); do
+            status=$(docker inspect --format '{{.State.Health.Status}}' terraform-mirror-tls)
+            running=$(docker inspect --format '{{.State.Running}}' terraform-mirror-tls)
+            if [ "$status" = healthy ] || [ "$running" = false ]; then break; fi
+            sleep 3
+          done
+          echo "tls health: $status (running=$running, after $i checks)"
+          docker logs terraform-mirror-tls
+          [ "$status" = healthy ]
+          docker rm -f terraform-mirror-tls

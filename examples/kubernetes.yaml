@@ -1,0 +1,144 @@
+# terraform-mirror on Kubernetes.
+#
+#   kubectl apply -f examples/kubernetes.yaml
+#
+# Two instances share one S3 bucket (that is what the download locks are for) and each keeps a
+# local disk cache in its own emptyDir. Drop the s3 backend and the Secret if you only need the
+# disk tier.
+#
+# The probes are the interesting part:
+#   startupProbe   the pod is not ready until the bucket answers (write probe included)
+#   readinessProbe taken out of the Service while the bucket is unreachable
+#   livenessProbe  /healthz only — never point it at /readyz, or an S3 outage restarts every pod
+# The second interesting part is the pair TFM_SHUTDOWN_GRACE < terminationGracePeriodSeconds: that is
+# what lets a draining pod release its download locks instead of leaving them for TFM_LOCK_TTL.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: terraform-mirror-s3
+  labels:
+    app: terraform-mirror
+type: Opaque
+stringData:
+  # Replace these; never commit the real values.
+  TFM_S3_ACCESS_KEY: "replace-me"
+  TFM_S3_SECRET_KEY: "replace-me"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: terraform-mirror-config
+  labels:
+    app: terraform-mirror
+data:
+  TFM_UPSTREAM_URL: "https://registry.terraform.io"
+  TFM_BACKENDS: "fs,s3"
+  TFM_EXTERNAL_URL: "https://tf.example.com"
+  TFM_S3_BUCKET: "terraform-mirror-cache"
+  TFM_S3_REGION: "us-east-1"
+  TFM_S3_PREFIX: "terraform-mirror"
+  # TFM_S3_ENDPOINT: "https://storage.example.net"   # only for MinIO / R2 / Ceph / Yandex OS
+  TFM_CACHE_DIR: "/var/cache/terraform-mirror"
+  TFM_LOG_LEVEL: "INFO"
+  # Seconds an in-flight download gets on SIGTERM before the pod hands its locks back.
+  # Must stay below terminationGracePeriodSeconds, or kubelet sends SIGKILL first and the
+  # lock of the download that was running survives until TFM_LOCK_TTL expires.
+  TFM_SHUTDOWN_GRACE: "15"
+  # Worst case a module stays locked after a hard kill (OOM, eviction, grace period too short).
+  TFM_LOCK_TTL: "300"
+  # A bucket that is briefly unreachable must not stop the process: the pods go NotReady and
+  # keep serving from the disk cache. Set to "true" to make it fatal instead.
+  TFM_STARTUP_REQUIRED: "false"
+  # "false" keeps an instance in rotation when only one tier is healthy.
+  TFM_READY_STRICT: "true"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: terraform-mirror
+  labels:
+    app: terraform-mirror
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: terraform-mirror
+  template:
+    metadata:
+      labels:
+        app: terraform-mirror
+      annotations:
+        # Scrape without a ServiceMonitor; swap for a ServiceMonitor/PodMonitor if you have one.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Long enough for TFM_SHUTDOWN_GRACE plus the time to close the socket and drain.
+      terminationGracePeriodSeconds: 30
+      # The image already switches to a non-root user, and its UID is assigned at build time, so
+      # no securityContext is set here. If your policy demands runAsNonRoot, pin runAsUser to the
+      # UID in the image (docker inspect --format '{{.Config.User}}') and match fsGroup to it.
+      containers:
+        - name: terraform-mirror
+          image: ghcr.io/kanlas-net/terraform-mirror:1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: terraform-mirror-config
+            - secretRef:
+                name: terraform-mirror-s3
+          volumeMounts:
+            - name: cache
+              mountPath: /var/cache/terraform-mirror
+          # With TFM_TLS_* set the socket speaks TLS and every httpGet below needs
+          # `scheme: HTTPS` — kubelet does not guess the scheme (and does not verify the
+          # certificate either). The image HEALTHCHECK, `terraform-mirror ping`, derives it from the
+          # environment by itself.
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+      volumes:
+        - name: cache
+          emptyDir:
+            sizeLimit: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: terraform-mirror
+  labels:
+    app: terraform-mirror
+spec:
+  selector:
+    app: terraform-mirror
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

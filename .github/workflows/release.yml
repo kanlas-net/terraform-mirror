@@ -1,0 +1,127 @@
+name: Release
+
+# Triggered by a version tag: v1.0.0 publishes
+#   ghcr.io/<owner>/terraform-mirror:1.0.0
+#   ghcr.io/<owner>/terraform-mirror:1.0
+#   ghcr.io/<owner>/terraform-mirror:1
+#   ghcr.io/<owner>/terraform-mirror:latest
+# The tag must match terraform_mirror.__version__, otherwise the run fails before pushing.
+
+on:
+  push:
+    # Glob, not a regex: ``*`` never matches ``/``. ``v*.*.*`` covers v1.0.0 and
+    # v1.0.0-rc.1 while refusing v1 and v1.2. The verify job below still has to
+    # agree with terraform_mirror.__version__, so a stray match fails instead of publishing.
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  verify:
+    name: verify the version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: The tag must equal the package version
+        run: |
+          pkg=$(python -c 'import terraform_mirror; print(terraform_mirror.__version__)')
+          tag=${GITHUB_REF_NAME#v}
+          echo "package=$pkg tag=$tag"
+          if [ "$pkg" != "$tag" ]; then
+            echo "::error::tag v$tag does not match terraform_mirror.__version__ $pkg"
+            exit 1
+          fi
+
+      - name: Unit tests
+        run: python -m unittest discover -s tests -t .
+
+  publish:
+    name: publish to ghcr
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.title=terraform-mirror
+            org.opencontainers.image.description=Caching mirror for the Terraform module registry and provider network protocols
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=runtime
+          cache-to: type=gha,mode=max,scope=runtime
+
+      - name: Inspect what landed in the registry
+        run: docker buildx imagetools inspect "${IMAGE}:${GITHUB_REF_NAME#v}"
+
+  release-notes:
+    name: github release
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      # gh --generate-notes shells out to git, so the job needs a working tree.
+      # Without this the step dies with "failed to run git: fatal: not a git repository".
+      - uses: actions/checkout@v4
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          VERSION=${GITHUB_REF_NAME#v}
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            # Deleting a tag does not delete its release: GitHub keeps it as a draft, and
+            # gh release view still finds drafts. A draft stays invisible on the release
+            # page, so a leftover draft has to be published instead of skipped.
+            if [ "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" = "true" ]; then
+              echo "release $GITHUB_REF_NAME is a draft, publishing it"
+              gh release edit "$GITHUB_REF_NAME" --draft=false
+            else
+              echo "release $GITHUB_REF_NAME is already published"
+            fi
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes \
+              --notes "Container image: \`ghcr.io/${{ github.repository }}:${VERSION}\`"
+          fi

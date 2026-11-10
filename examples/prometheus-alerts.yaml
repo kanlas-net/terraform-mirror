@@ -1,0 +1,119 @@
+# Prometheus rules for terraform-mirror.
+#
+# Either apply as a PrometheusRule (prometheus-operator):
+#
+#   kubectl apply -f examples/prometheus-alerts.yaml
+#
+# or copy the expressions into your own rule files — the alerts do not depend on the operator.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: terraform-mirror
+  labels:
+    release: prometheus
+spec:
+  groups:
+    - name: terraform-mirror-registry
+      rules:
+        # The proxy could not use the upstream registry. 404s are a real answer and are not
+        # counted here, so a typo in a module address never pages anybody.
+        - alert: TerraformRegistryUnreachable
+          expr: sum by (instance) (increase(terraform_mirror_upstream_errors_total[5m])) > 3
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "terraform-mirror cannot use the upstream registry"
+            description: >-
+              {{ $value | printf "%.0f" }} failed upstream calls in the last 5 minutes on
+              {{ $labels.instance }}. Clients are being served stale cache or 502s.
+              Check TFM_UPSTREAM_URL, egress and the registry status.
+
+        # Catches a total outage at low traffic, where a rate over a small denominator is useless:
+        # the gauge is the timestamp of the last successful call per operation.
+        - alert: TerraformRegistrySilent
+          expr: time() - terraform_mirror_upstream_last_success_timestamp_seconds > 300
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "no successful registry call for 5 minutes"
+            description: >-
+              Operation {{ $labels.op }} on {{ $labels.instance }} has not succeeded for
+              {{ $value | printf "%.0f" }} seconds.
+
+        - alert: TerraformRegistrySlow
+          expr: >-
+            histogram_quantile(0.95, sum by (le, op) (rate(terraform_mirror_upstream_request_seconds_bucket[5m]))) > 5
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "the upstream registry is slow"
+            description: "p95 of {{ $labels.op }} is {{ $value | printf \"%.1f\" }} s."
+
+    - name: terraform-mirror-downloads
+      rules:
+        # The one the operator actually cares about: clients asked for modules and the archives
+        # never arrived. The oldest pending request is the one to alert on.
+        - alert: TerraformModulesNotDownloaded
+          expr: terraform_mirror_archive_pending_oldest_seconds > 600
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "requested Terraform modules are not being downloaded"
+            description: >-
+              On {{ $labels.instance }} a module version has been waiting {{ $value | printf "%.0f" }}
+              seconds for its archive. Run `terraform-mirror healthcheck --pending` (or GET /api/v1/pending)
+              to see which one and why.
+
+        - alert: TerraformPendingBacklog
+          expr: terraform_mirror_archive_pending_modules > 20
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "the download backlog is growing"
+            description: "{{ $value }} module versions are still outstanding on {{ $labels.instance }}."
+
+        - alert: TerraformDownloadsFailing
+          expr: >-
+            sum by (instance) (rate(terraform_mirror_archive_downloads_total{result=~"error|store_error"}[5m])) > 0.05
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "archive downloads from the origin are failing"
+            description: "{{ $value | printf \"%.2f\" }} failed fetches per second on {{ $labels.instance }}."
+
+    - name: terraform-mirror-serving
+      rules:
+        - alert: TerraformProxyFailingRequests
+          expr: sum by (instance) (rate(terraform_mirror_http_errors_total{code!="module_not_found"}[5m])) > 0.5
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "terraform-mirror is answering with errors"
+            description: "{{ $value | printf \"%.2f\" }} error responses per second on {{ $labels.instance }}."
+
+        - alert: TerraformStorageProbeFailing
+          expr: terraform_mirror_storage_probe_up == 0
+          for: 3m
+          labels:
+            severity: critical
+          annotations:
+            summary: "a storage backend stopped answering"
+            description: >-
+              Backend {{ $labels.backend }} on {{ $labels.instance }} failed its last probe; the pod
+              is not ready. `terraform-mirror healthcheck` prints the reason (AccessDenied, NoSuchBucket, ...).
+
+        - alert: TerraformQueueSaturated
+          expr: terraform_mirror_jobs{name="queued"} > 500
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "the background download queue is backing up"
+            description: "{{ $value }} queued jobs on {{ $labels.instance }}; raise TFM_WORKERS or check the origin."
