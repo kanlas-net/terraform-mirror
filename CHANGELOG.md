@@ -6,6 +6,18 @@ publishes the image to `ghcr.io`.
 
 ## [Unreleased]
 
+### Changed
+
+- README: a "Resource requirements" section with measured numbers — idle RSS and thread count, what
+  streaming, hashing and repacking cost, a floor and a comfortable sizing for Kubernetes and
+  `podman-compose`, disk and connection guidance, and the two `/metrics` series to verify it with.
+
+### Fixed
+
+- README: the "Limitations" section still claimed providers were not proxied. They are, since 1.0.0;
+  the bullet now says what the network mirror does and does not cover (hash-based integrity instead of
+  `SHA256SUMS` and signing keys, `TFM_PROVIDER_PLATFORMS` as the advertised set).
+
 ## [1.0.0] - 2026-11-10
 
 First release. A caching mirror for the two protocols the Terraform CLI reads from a registry, in

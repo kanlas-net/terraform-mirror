@@ -460,6 +460,62 @@ The order the pod actually runs on `SIGTERM` is in
 how to re-download something the cache should not be trusted on is in
 [Re-downloading something that is already cached](#re-downloading-something-that-is-already-cached).
 
+## Resource requirements
+
+Measured on a running proxy, not estimated: the figures below came from a local run that scraped its
+own `/metrics` (`terraform_mirror_process_max_rss_bytes` is peak RSS, `terraform_mirror_process_threads`
+live threads), plus what `examples/kubernetes.yaml` already carries.
+
+* **Idle.** One process: 27.7 MiB RSS (29 024 256 bytes) and 7 threads — one serving HTTP,
+  `TFM_WORKERS` (4) background downloaders, the rest housekeeping. CPU is effectively zero. The image
+  is `python:3.12-slim` with no runtime dependencies, so nothing else gets mapped in.
+* **Serving does not scale with archive size.** Archives are streamed out in 256 KiB chunks
+  (`DEFAULT_CHUNK` in `terraform_mirror/storage/base.py`) and read back the same way, so a 500 MB
+  provider zip never sits in memory; a live connection costs about 256 KiB of buffers.
+* **Hashing is cheap.** `h1:`/`zh:` are computed from a 1 MiB stream: 126 MB of provider archive in
+  0.2 s, memory flat.
+* **The one real peak is repacking.** A `github://` source whose files live under a nested directory is
+  repacked so the binary lands in the zip root and the hashes describe the bytes we serve, and
+  `normalize_package` reads that member into memory before deflating it. Measured on a 120 MB member:
+  peak RSS +239 MiB (about 2x the largest file in the archive) and 2.7 s of one core (~45 MB/s of
+  deflate). HashiCorp release archives are already flat, so in the ordinary case repacking never runs
+  and CPU is not the story. The ceiling is `TFM_MAX_ARCHIVE_MB` (512) multiplied by how many workers
+  repack at once — four concurrent worst-case repacks are roughly 1 GiB. Lower `TFM_MAX_ARCHIVE_MB` if
+  that is more than you want to spend.
+
+### What to configure
+
+* Floor, "it starts and serves": **1 vCPU / 256 MiB**.
+* Comfortable, and what `examples/kubernetes.yaml` asks for: **request `100m` / `128Mi`, limit
+  `512Mi`** — one whole core is already generous for a development team.
+* `podman-compose` equivalent:
+
+  ```yaml
+  deploy:
+    resources:
+      limits:
+        cpus: "2"
+        memory: 1G
+  ```
+
+  `deploy.resources.limits` is honoured by podman-compose — check with
+  `podman inspect <container> --format '{{.HostConfig.Memory}}'`. The 1 GiB exists purely for
+  concurrent repacks; a module-only mirror is comfortable at 512 MiB.
+
+**Disk.** The cache is exactly as big as what you actually mirror; `examples/kubernetes.yaml` uses a
+10 GiB `emptyDir`. With `TFM_BACKENDS=fs,s3` the disk is only the warm tier and the bucket holds the
+bulk, so the volume can stay small.
+
+**Connections.** The server is a `ThreadingHTTPServer`: one thread per connection, no cap of its own.
+Do not put it on the open internet directly — front it with nginx and `limit_conn`. The knobs that
+actually bound concurrency are `TFM_WORKERS` (4) and `TFM_QUEUE_MAX` (2000).
+
+**Check it on your own traffic** rather than trusting these numbers, after a real `terraform init`:
+
+```bash
+curl -s localhost:8080/metrics | grep -E 'terraform_mirror_process_(max_rss_bytes|threads)'
+```
+
 ## Metrics
 
 `GET /metrics` serves Prometheus text format 0.0.4, written by hand (`terraform_mirror/metrics.py`) — the
@@ -593,8 +649,11 @@ The image in the registry: `ghcr.io/kanlas-net/terraform-mirror`.
 
 ## Limitations
 
-* The **module** protocol only. Providers (`/v1/providers/...`, `SHA256SUMS`, key signatures)
-  are not proxied — `getproviders` mirrors exist for those.
+* Providers are served as a **network mirror** and nothing else: the CLI has to be configured with
+  `provider_installation { network_mirror { … } }`, and integrity rests on the `h1:`/`zh:` hashes the
+  mirror computes over the bytes it returns, not on the upstream registry's `SHA256SUMS` and signing
+  keys. A `filesystem_mirror` built by `terraform providers mirror` is a different mechanism and is
+  not what this serves. Only the platforms in `TFM_PROVIDER_PLATFORMS` are advertised.
 * Terraform requires HTTPS for external hosts; for production add TLS
   (`TFM_TLS_CERT`/`TFM_TLS_KEY` or a reverse proxy). `http://` is convenient only for local
   experiments on `127.0.0.1`.
